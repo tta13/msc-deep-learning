@@ -105,6 +105,7 @@ def get_args_parser():
     parser.add_argument('--optimizer', default='adamw', type=str,
         choices=['adam', 'adamw', 'sgd', 'lars'], help="""Type of optimizer. We recommend using adamw with ViTs.""")
     parser.add_argument('--drop_path_rate', type=float, default=0.1, help="stochastic depth rate")
+    parser.add_argument('--resume_training', type=bool, default=False, help="Resume training from checkpoint.")
 
     # Multi-crop parameters
     parser.add_argument('--global_crops_scale', type=float, nargs='+', default=(0.4, 1.),
@@ -186,9 +187,9 @@ def train_dino(args):
     elif args.arch in torchvision_models.__dict__.keys():
         student = torchvision_models.__dict__[args.arch](pretrained=args.pretrained) # modified to get pre-trained version
         teacher = torchvision_models.__dict__[args.arch](pretrained=args.pretrained) # modified to get pre-trained version
-        embed_dim = student.classifier[1].out_features
+        embed_dim = student.classifier[1].in_features # modified to work with efficientnet
     else:
-        print(f"Unknow architecture: {args.arch}")
+        raise NotImplementedError(f"Unknow architecture: {args.arch}")
 
     # multi-crop wrapper handles forward with inputs of different resolutions
     student = utils.MultiCropWrapper(student, DINOHead(
@@ -249,7 +250,13 @@ def train_dino(args):
         fp16_scaler = torch.cuda.amp.GradScaler()
 
     # ============ init schedulers ... ============
-    lr_schedule = utils.constant_scheduler(args.lr, args.epochs, len(data_loader)) # Use fixed learning rate
+    lr_schedule = utils.cosine_scheduler(
+        args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / args.batch_size_per_gpu,  # linear scaling rule
+        args.min_lr,
+        args.epochs, len(data_loader),
+        warmup_epochs=args.warmup_epochs,
+    )
+
     wd_schedule = utils.cosine_scheduler(
         args.weight_decay,
         args.weight_decay_end,
@@ -262,15 +269,18 @@ def train_dino(args):
 
     # ============ optionally resume training ... ============
     to_restore = {"epoch": 0}
-    utils.restart_from_checkpoint(
-        os.path.join(args.output_dir, "checkpoint.pth"),
-        run_variables=to_restore,
-        student=student,
-        teacher=teacher,
-        optimizer=optimizer,
-        fp16_scaler=fp16_scaler,
-        dino_loss=dino_loss,
-    )
+    
+    if args.resume_training:
+        utils.restart_from_checkpoint(
+            os.path.join(args.output_dir, "checkpoint.pth"),
+            run_variables=to_restore,
+            student=student,
+            teacher=teacher,
+            optimizer=optimizer,
+            fp16_scaler=fp16_scaler,
+            dino_loss=dino_loss,
+        )
+    
     start_epoch = to_restore["epoch"]
 
     start_time = time.time()
@@ -307,11 +317,11 @@ def train_dino(args):
     print('Training time {}'.format(total_time_str))
 
 def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loader,
-                    optimizer, lr_schedule, wd_schedule, momentum_schedule,epoch,
+                    optimizer, lr_schedule, wd_schedule, momentum_schedule, epoch,
                     fp16_scaler, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
-    for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 20, header)):
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
@@ -366,7 +376,6 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-
 
 class DINOLoss(nn.Module):
     def __init__(self, out_dim, ncrops, warmup_teacher_temp, teacher_temp,
